@@ -1,0 +1,22 @@
+# Rust build output
+/target/
+
+# Cargo lock (keep for binaries, ignore for libraries)
+# Cargo.lock  # We keep this for reproducible builds
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test output
+*.pcap
+*.pcapng
+*.json.out
+*.csv.out
