@@ -7,9 +7,6 @@ pub enum AnalyzerError {
     #[error("无法打开文件: {0}")]
     FileOpen(String),
 
-    #[error("文件读取错误: {0}")]
-    FileRead(String),
-
     #[error("pcap 解析错误: {0}")]
     PcapParse(String),
 

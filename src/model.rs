@@ -101,6 +101,22 @@ pub struct TcpState {
     pub bytes_ab: u64,
     /// B → A 方向的字节数
     pub bytes_ba: u64,
+    /// A → B 方向观察到的最小 SEQ
+    pub seq_start_ab: Option<u32>,
+    /// A → B 方向观察到的最大 SEQ
+    pub seq_end_ab: Option<u32>,
+    /// B → A 方向观察到的最小 SEQ
+    pub seq_start_ba: Option<u32>,
+    /// B → A 方向观察到的最大 SEQ
+    pub seq_end_ba: Option<u32>,
+    /// A → B 方向观察到的最小 ACK
+    pub ack_start_ab: Option<u32>,
+    /// A → B 方向观察到的最大 ACK
+    pub ack_end_ab: Option<u32>,
+    /// B → A 方向观察到的最小 ACK
+    pub ack_start_ba: Option<u32>,
+    /// B → A 方向观察到的最大 ACK
+    pub ack_end_ba: Option<u32>,
 
     /// 第一个包的时间戳 (微秒)
     pub first_ts_micros: Option<i64>,
@@ -131,6 +147,12 @@ pub struct SmtpState {
     pub starttls_seen: bool,
     /// 经过的 SMTP 阶段列表
     pub stages: Vec<String>,
+    /// Whether the client has sent DATA and we are still waiting for 354.
+    pub awaiting_data_response: bool,
+    /// Per-direction line assembly buffer for client -> server traffic.
+    pub pending_line_ab: Vec<u8>,
+    /// Per-direction line assembly buffer for server -> client traffic.
+    pub pending_line_ba: Vec<u8>,
 }
 
 /// 原始数据包 (解码后)
@@ -173,30 +195,16 @@ pub struct TcpFlags {
 }
 
 impl TcpFlags {
-    pub fn from_bits(bits: u8) -> Self {
-        Self {
-            fin: (bits & 0x01) != 0,
-            syn: (bits & 0x02) != 0,
-            rst: (bits & 0x04) != 0,
-            psh: (bits & 0x08) != 0,
-            ack: (bits & 0x10) != 0,
-        }
-    }
-
     /// 是否是纯 ACK 包 (只有 ACK 标志，没有载荷)
     pub fn is_pure_ack(&self) -> bool {
         self.ack && !self.syn && !self.fin && !self.rst && !self.psh
-    }
-
-    /// 是否有有效载荷 (PSH 或有数据)
-    pub fn has_payload(&self) -> bool {
-        self.psh || self.syn || self.fin
     }
 }
 
 /// 单条流分析结果
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlowResult {
+    pub flow_index: usize,
     /// 源 IP
     pub src_ip: String,
     /// 源端口
@@ -205,8 +213,11 @@ pub struct FlowResult {
     pub dst_ip: String,
     /// 目标端口
     pub dst_port: u16,
-    /// VLAN 标签 (如果有)
+    /// 主 VLAN 标签 (仅在该流只观察到单一带标签 VLAN 时设置)
     pub vlan: Option<u16>,
+    /// 该流观察到的 VLAN 上下文
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observed_vlans: Vec<String>,
     /// 完整性结论
     pub completeness: Completeness,
     /// 双向性结论
@@ -219,6 +230,22 @@ pub struct FlowResult {
     pub bytes_ab: u64,
     /// B → A 字节数
     pub bytes_ba: u64,
+    /// A → B 方向观察到的 SEQ 起始
+    pub seq_start_ab: Option<u32>,
+    /// A → B 方向观察到的 SEQ 结束
+    pub seq_end_ab: Option<u32>,
+    /// B → A 方向观察到的 SEQ 起始
+    pub seq_start_ba: Option<u32>,
+    /// B → A 方向观察到的 SEQ 结束
+    pub seq_end_ba: Option<u32>,
+    /// A → B 方向观察到的 ACK 起始
+    pub ack_start_ab: Option<u32>,
+    /// A → B 方向观察到的 ACK 结束
+    pub ack_end_ab: Option<u32>,
+    /// B → A 方向观察到的 ACK 起始
+    pub ack_start_ba: Option<u32>,
+    /// B → A 方向观察到的 ACK 结束
+    pub ack_end_ba: Option<u32>,
     /// TCP 握手是否完整
     pub tcp_handshake_complete: bool,
     /// TCP 连接是否正常关闭
@@ -227,6 +254,34 @@ pub struct FlowResult {
     pub smtp_stages: Vec<String>,
     /// 异常标签
     pub anomaly_tags: Vec<String>,
+    /// 额外诊断说明
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostic_notes: Vec<String>,
+}
+
+/// 诊断结果
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Diagnostic {
+    /// 诊断类型
+    pub kind: String,
+    /// 受影响的流号（从 1 开始）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub flow_indices: Vec<usize>,
+    /// 面向展示的简洁诊断结论
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub summary: String,
+    /// 源 IP
+    pub src_ip: String,
+    /// 源端口
+    pub src_port: u16,
+    /// 目标 IP
+    pub dst_ip: String,
+    /// 目标端口
+    pub dst_port: u16,
+    /// 观察到的 VLAN 上下文
+    pub observed_vlans: Vec<String>,
+    /// 诊断证据
+    pub evidence: Vec<String>,
 }
 
 /// 分析报告
@@ -236,6 +291,9 @@ pub struct Report {
     pub summary: Summary,
     /// 每条流的分析结果
     pub flows: Vec<FlowResult>,
+    /// 额外诊断结果
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<Diagnostic>,
 }
 
 /// 汇总统计
@@ -253,4 +311,6 @@ pub struct Summary {
     pub incomplete_unidirectional: u64,
     /// 跳过的无法解析的包数
     pub skipped_packets: u64,
+    /// 疑似 VLAN 不对称导致拆流的会话数
+    pub suspected_vlan_asymmetry_sessions: u64,
 }

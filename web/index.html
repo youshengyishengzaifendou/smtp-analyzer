@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SMTP Analyzer</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="page-shell">
+    <header class="hero">
+      <p class="hero-kicker">SMTP 抓包分析台</p>
+      <h1>上传抓包，开始分析，再看流信息。</h1>
+      <p class="hero-copy">页面只做一件事：把 `pcap / pcapng` 文件变成可读的 SMTP 流结论，尤其帮你盯住 VLAN 不对称拆流这种问题。</p>
+      <div class="hero-status">
+        <span class="status-pill" id="service-pill">检查中</span>
+        <span class="status-hint">本地服务: <strong>127.0.0.1:8080</strong></span>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <section class="stage-card upload-stage">
+        <div class="stage-head">
+          <span class="stage-index">01</span>
+          <div>
+            <h2>上传抓包文件</h2>
+            <p>先把待分析的 `pcap` 或 `pcapng` 文件拖进来，或者点按钮选择文件。</p>
+          </div>
+        </div>
+
+        <label class="dropzone" for="pcap-file">
+          <input id="pcap-file" type="file" accept=".pcap,.pcapng,.cap,.dump,application/octet-stream">
+          <div class="dropzone-core">
+            <div class="dropzone-mark"></div>
+            <p class="dropzone-title">选择或拖拽文件</p>
+            <p class="dropzone-copy">建议用浏览器本地文件选择，不再手工输入路径。</p>
+          </div>
+        </label>
+
+        <div class="file-card file-card-empty" id="file-card">
+          <p class="file-title">尚未选择文件</p>
+          <p class="file-meta">选择文件后，这里会显示名称、大小和扩展名。</p>
+        </div>
+      </section>
+
+      <section class="stage-card config-stage">
+        <div class="stage-head">
+          <span class="stage-index">02</span>
+          <div>
+            <h2>配置分析参数</h2>
+            <p>默认监控 25 / 587 / 465，必要时可以切换到忽略 VLAN 的主视图。</p>
+          </div>
+        </div>
+
+        <div class="config-grid">
+          <label class="field">
+            <span class="field-label">SMTP 端口</span>
+            <input id="ports" type="text" value="25,587,465">
+          </label>
+
+          <label class="switch-card">
+            <span class="field-label">主分析视图</span>
+            <span class="switch-copy">打开后，页面主结果以 Ignore VLAN 视图为准，但仍然保留 VLAN 拆流诊断。</span>
+            <span class="switch-row">
+              <input id="ignore-vlan" type="checkbox">
+              <span class="switch-ui"></span>
+              <span class="switch-text">忽略 VLAN</span>
+            </span>
+          </label>
+        </div>
+
+        <div class="action-row">
+          <button id="analyze-button" class="analyze-button" disabled>开始分析</button>
+          <p class="action-hint" id="action-hint">先上传一个抓包文件。</p>
+        </div>
+      </section>
+
+      <section class="stage-card status-stage">
+        <div class="stage-head">
+          <span class="stage-index">03</span>
+          <div>
+            <h2>分析状态</h2>
+            <p>上传、分析和错误信息都会显示在这里。</p>
+          </div>
+        </div>
+
+        <div class="status-board">
+          <span class="request-pill" id="request-pill">空闲</span>
+          <pre id="status-log">等待文件上传。</pre>
+        </div>
+      </section>
+
+      <section class="results-stage hidden" id="results-stage">
+        <div class="results-head">
+          <div>
+            <p class="hero-kicker">分析结果</p>
+            <h2 id="result-title">分析结果</h2>
+            <p id="result-subtitle">结果会在这里出现。</p>
+          </div>
+          <button id="reset-button" class="ghost-button">重新开始</button>
+        </div>
+
+        <div class="summary-grid" id="summary-grid"></div>
+
+        <div class="result-columns">
+          <section class="result-card diagnostics-card">
+            <div class="result-card-head">
+              <h3>诊断结论</h3>
+              <span class="mini-pill" id="diagnostic-count">0</span>
+            </div>
+            <div id="diagnostics-list" class="stack-area empty-copy">没有诊断结果。</div>
+          </section>
+
+          <section class="result-card flows-card">
+            <div class="result-card-head">
+              <h3>流信息</h3>
+              <span class="mini-pill" id="flow-count">0</span>
+            </div>
+            <div id="flows-list" class="stack-area empty-copy">分析完成后，这里会列出每条流的状态和异常标签。</div>
+          </section>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <template id="summary-template">
+    <article class="summary-card">
+      <p class="summary-label"></p>
+      <strong class="summary-value"></strong>
+    </article>
+  </template>
+
+  <template id="diagnostic-template">
+    <article class="diagnostic-card">
+        <div class="diagnostic-top">
+          <div>
+          <p class="card-kicker">诊断会话</p>
+          <h4 class="diagnostic-title"></h4>
+        </div>
+        <span class="tag danger-tag">疑似 VLAN 不对称</span>
+      </div>
+      <p class="diagnostic-meta"></p>
+      <ul class="evidence-list"></ul>
+    </article>
+  </template>
+
+  <template id="flow-template">
+    <article class="flow-card">
+      <div class="flow-top">
+        <div>
+          <h4 class="flow-title"></h4>
+          <p class="flow-meta"></p>
+        </div>
+        <div class="flow-tags"></div>
+      </div>
+      <div class="flow-stats"></div>
+      <ul class="flow-notes"></ul>
+    </article>
+  </template>
+
+  <script src="/app.js" defer></script>
+</body>
+</html>

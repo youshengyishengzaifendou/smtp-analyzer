@@ -1,24 +1,23 @@
 //! SMTP 流量完整性分析工具
 //!
-//! 分析 pcap/pcapng 文件中的 SMTP 流量，判断每条流是否完整、是否双向
+//! 分析 pcap/pcapng 文件中的 SMTP 流量，判断每条流是否完整、是否双向。
 
 mod analyzer;
+mod app;
 mod capture;
 mod decoder;
 mod error;
 mod flow;
 mod model;
 mod report;
+mod service;
 
 use clap::Parser;
-use log::{debug, info, LevelFilter};
 use env_logger::Builder;
+use log::{info, LevelFilter};
 use std::io::Write;
 
-use crate::analyzer::Analyzer;
-use crate::capture::CaptureReader;
-use crate::decoder::Decoder;
-use crate::flow::FlowTable;
+use crate::app::{analyze_capture, parse_ports, AnalysisRequest};
 use crate::report::ReportWriter;
 
 /// 命令行参数
@@ -29,7 +28,7 @@ use crate::report::ReportWriter;
     long_about = None
 )]
 struct Args {
-    /// 要分析的文件路径
+    /// 要执行的命令
     #[command(subcommand)]
     command: Command,
 }
@@ -62,6 +61,21 @@ enum Command {
         #[arg(short, long)]
         verbose: bool,
     },
+
+    /// 启动本地 HTTP 服务，供页面调用分析接口
+    Serve {
+        /// 监听地址
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+
+        /// 监听端口
+        #[arg(short, long, default_value_t = 8080)]
+        port: u16,
+
+        /// 详细日志输出
+        #[arg(short, long)]
+        verbose: bool,
+    },
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -76,81 +90,62 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ignore_vlan,
             verbose,
         } => {
-            // 初始化日志
-            let level = if verbose {
-                LevelFilter::Debug
-            } else {
-                LevelFilter::Info
-            };
+            init_logging(verbose);
 
-            Builder::new()
-                .filter_level(level)
-                .format(|buf, record| {
-                    writeln!(buf, "{}", record.args())
-                })
-                .init();
-
-            // 解析端口
-            let port_list: Vec<u16> = ports
-                .split(',')
-                .filter_map(|s| s.trim().parse().ok())
-                .collect();
-
+            let port_list = parse_ports(&ports);
             info!("分析文件: {}", file);
             info!("监控端口: {:?}", port_list);
             info!("忽略 VLAN: {}", ignore_vlan);
 
-            // 创建解码器
-            let mut decoder = Decoder::new();
-            decoder.set_ports(port_list);
+            let response = analyze_capture(&AnalysisRequest {
+                file: file.clone(),
+                ports: port_list,
+                ignore_vlan,
+            })?;
 
-            // 打开抓包文件
-            let mut reader = CaptureReader::open(&file)?;
+            info!("分析完成，共处理 {} 个数据包", response.packet_count);
+            info!(
+                "严格 VLAN 视图发现 {} 条 SMTP 流",
+                response.strict_flow_count
+            );
+            info!(
+                "忽略 VLAN 视图发现 {} 条 SMTP 流",
+                response.merged_flow_count
+            );
 
-            // 创建流表
-            let mut flow_table = FlowTable::new(ignore_vlan);
+            ReportWriter::print_summary(&response.report);
 
-            // 迭代处理每个包
-            let mut packet_count = 0;
-            for packet_result in reader.iter() {
-                match packet_result {
-                    Ok(packet) => {
-                        flow_table.add_packet(&packet);
-                        packet_count += 1;
-
-                        if verbose && packet_count % 10000 == 0 {
-                            info!("已处理 {} 个数据包...", packet_count);
-                        }
-                    }
-                    Err(e) => {
-                        debug!("处理数据包时出错: {}", e);
-                    }
-                }
-            }
-
-            info!("分析完成，共处理 {} 个数据包", packet_count);
-            info!("发现 {} 条 SMTP 流", flow_table.len());
-
-            // 分析并生成报告
-            let skipped_count = reader.skipped_count();
-            let report = Analyzer::analyze(&flow_table, skipped_count);
-
-            // 输出报告
-            ReportWriter::print_summary(&report);
-
-            // 输出 JSON
             if let Some(json_path) = json {
-                ReportWriter::write_json(&report, &json_path)?;
+                ReportWriter::write_json(&response.report, &json_path)?;
                 info!("JSON 报告已保存到: {}", json_path);
             }
 
-            // 输出 CSV
             if let Some(csv_path) = csv {
-                ReportWriter::write_csv(&report, &csv_path)?;
+                ReportWriter::write_csv(&response.report, &csv_path)?;
                 info!("CSV 报告已保存到: {}", csv_path);
             }
 
             Ok(())
         }
+        Command::Serve { host, port, verbose } => {
+            init_logging(verbose);
+            service::serve(&host, port)?;
+            Ok(())
+        }
     }
+}
+
+fn init_logging(verbose: bool) {
+    let level = if verbose {
+        LevelFilter::Debug
+    } else {
+        LevelFilter::Info
+    };
+
+    let mut builder = Builder::new();
+    builder
+        .filter_level(level)
+        .format(|buf, record| writeln!(buf, "{}", record.args()));
+
+    let _ = builder.try_init();
 }

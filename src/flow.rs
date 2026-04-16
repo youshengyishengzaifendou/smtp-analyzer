@@ -1,26 +1,21 @@
-//! 流聚合模块
+//! Flow aggregation.
 //!
-//! 将数据包按五元组聚合到流中
+//! Groups decoded packets into session flows and tracks TCP/SMTP state.
 
 use std::collections::HashMap;
-use std::hash::Hash;
-use std::net::IpAddr;
+
 use smallvec::SmallVec;
 
-use crate::model::{
-    DecodedPacket, Direction, Endpoint, SessionKey, SmtpState, TcpState,
-};
+use crate::model::{DecodedPacket, Direction, SessionKey, SmtpState, TcpState};
 
-/// 流表
+/// Aggregated flow table keyed by normalized session identity.
 pub struct FlowTable {
-    /// 是否忽略 VLAN
+    /// Whether VLAN tags should be ignored when building the session key.
     ignore_vlan: bool,
-    /// 流数据
     flows: HashMap<SessionKey, FlowData>,
 }
 
 impl FlowTable {
-    /// 创建流表
     pub fn new(ignore_vlan: bool) -> Self {
         Self {
             ignore_vlan,
@@ -28,7 +23,6 @@ impl FlowTable {
         }
     }
 
-    /// 添加数据包到流
     pub fn add_packet(&mut self, packet: &DecodedPacket) {
         let key = self.build_session_key(packet);
 
@@ -45,7 +39,6 @@ impl FlowTable {
         flow.add_packet(packet);
     }
 
-    /// 构建会话键
     fn build_session_key(&self, packet: &DecodedPacket) -> SessionKey {
         let vlan_stack = if self.ignore_vlan {
             SmallVec::new()
@@ -63,88 +56,85 @@ impl FlowTable {
         )
     }
 
-    /// 获取所有流
     pub fn flows(&self) -> &HashMap<SessionKey, FlowData> {
         &self.flows
     }
 
-    /// 获取流数量
     pub fn len(&self) -> usize {
         self.flows.len()
     }
-
-    /// 是否为空
-    pub fn is_empty(&self) -> bool {
-        self.flows.is_empty()
-    }
 }
 
-/// 单条流的数据
+/// Per-session state derived from the decoded packet stream.
 #[derive(Debug, Clone)]
 pub struct FlowData {
-    /// 源 IP
     pub src_ip: String,
-    /// 源端口
     pub src_port: u16,
-    /// 目标 IP
     pub dst_ip: String,
-    /// 目标端口
     pub dst_port: u16,
-    /// VLAN 标签栈
-    pub vlan_stack: SmallVec<[u16; 2]>,
-    /// TCP 状态
+    pub observed_vlan_stacks: Vec<SmallVec<[u16; 2]>>,
     pub tcp: TcpState,
-    /// SMTP 状态
     pub smtp: SmtpState,
 }
 
 impl FlowData {
-    pub fn new(src_ip: String, src_port: u16, dst_ip: String, dst_port: u16, vlan_stack: SmallVec<[u16; 2]>) -> Self {
+    pub fn new(
+        src_ip: String,
+        src_port: u16,
+        dst_ip: String,
+        dst_port: u16,
+        vlan_stack: SmallVec<[u16; 2]>,
+    ) -> Self {
         Self {
             src_ip,
             src_port,
             dst_ip,
             dst_port,
-            vlan_stack,
+            observed_vlan_stacks: vec![vlan_stack],
             tcp: TcpState::default(),
             smtp: SmtpState::default(),
         }
     }
 
-    /// 添加数据包
     pub fn add_packet(&mut self, packet: &DecodedPacket) {
         let direction = packet.direction;
         let payload_len = packet.payload.len() as u64;
 
-        // 更新第一个包的时间戳
+        self.observe_vlan_stack(packet.vlan_stack.clone());
+
         if self.tcp.first_ts_micros.is_none() {
             self.tcp.first_ts_micros = Some(packet.timestamp_micros);
         }
         self.tcp.last_ts_micros = Some(packet.timestamp_micros);
 
-        // 更新 TCP 状态
         match direction {
             Direction::AtoB => {
                 self.tcp.packets_ab += 1;
                 self.tcp.bytes_ab += payload_len;
+                update_u32_min_max(
+                    &mut self.tcp.seq_start_ab,
+                    &mut self.tcp.seq_end_ab,
+                    packet.seq_num,
+                );
+                update_u32_min_max(
+                    &mut self.tcp.ack_start_ab,
+                    &mut self.tcp.ack_end_ab,
+                    packet.ack_num,
+                );
 
-                // 检测 SYN
                 if packet.tcp_flags.syn && !packet.tcp_flags.ack {
                     self.tcp.syn_seen_ab = true;
                 }
 
-                // 检测握手 ACK (三次握手中的第三个 ACK)
                 if packet.tcp_flags.ack && self.tcp.syn_seen_ab && self.tcp.syn_ack_seen {
                     self.tcp.handshake_ack_seen = true;
                     self.tcp.handshake_complete = true;
                 }
 
-                // 检测 FIN/RST
                 if packet.tcp_flags.fin || packet.tcp_flags.rst {
                     self.tcp.fin_or_rst_seen = true;
                 }
 
-                // 检测有效载荷
                 if payload_len > 0 && !packet.tcp_flags.is_pure_ack() {
                     self.tcp.has_payload_ab = true;
                 }
@@ -152,108 +142,329 @@ impl FlowData {
             Direction::BtoA => {
                 self.tcp.packets_ba += 1;
                 self.tcp.bytes_ba += payload_len;
+                update_u32_min_max(
+                    &mut self.tcp.seq_start_ba,
+                    &mut self.tcp.seq_end_ba,
+                    packet.seq_num,
+                );
+                update_u32_min_max(
+                    &mut self.tcp.ack_start_ba,
+                    &mut self.tcp.ack_end_ba,
+                    packet.ack_num,
+                );
 
-                // 检测 SYN-ACK
                 if packet.tcp_flags.syn && packet.tcp_flags.ack {
                     self.tcp.syn_ack_seen = true;
                 }
 
-                // 检测 FIN/RST
                 if packet.tcp_flags.fin || packet.tcp_flags.rst {
                     self.tcp.fin_or_rst_seen = true;
                 }
 
-                // 检测有效载荷
                 if payload_len > 0 && !packet.tcp_flags.is_pure_ack() {
                     self.tcp.has_payload_ba = true;
                 }
             }
         }
 
-        // 更新 SMTP 状态 (如果是明文 SMTP 且有载荷)
-        if self.src_port == 25 || self.src_port == 587 {
+        if self.dst_port == 25 || self.dst_port == 587 {
             self.update_smtp_state(packet);
         } else if self.dst_port == 465 {
-            // 465 端口是隐式 TLS
             self.smtp.is_implicit_tls = true;
         }
     }
 
-    /// 更新 SMTP 状态
+    fn observe_vlan_stack(&mut self, vlan_stack: SmallVec<[u16; 2]>) {
+        if !self
+            .observed_vlan_stacks
+            .iter()
+            .any(|existing| existing == &vlan_stack)
+        {
+            self.observed_vlan_stacks.push(vlan_stack);
+        }
+    }
+
     fn update_smtp_state(&mut self, packet: &DecodedPacket) {
         let payload = &packet.payload;
         if payload.is_empty() {
             return;
         }
 
-        // 尝试解析 SMTP 行
-        if let Ok(text) = std::str::from_utf8(payload) {
-            for line in text.lines() {
-                let line = line.trim();
-                if line.is_empty() {
-                    continue;
-                }
+        let mut ready_lines = Vec::new();
+        {
+            let buffer = match packet.direction {
+                Direction::AtoB => &mut self.smtp.pending_line_ab,
+                Direction::BtoA => &mut self.smtp.pending_line_ba,
+            };
 
-                // 解析服务端响应
-                if line.starts_with("220") && !self.smtp.banner_seen {
-                    self.smtp.banner_seen = true;
-                    self.add_stage("banner");
-                }
+            buffer.extend_from_slice(payload);
 
-                // 解析客户端命令
-                if line.starts_with("EHLO ") || line.starts_with("HELO ") {
-                    self.smtp.helo_seen = true;
-                    if !self.smtp.stages.contains(&"helo".to_string()) {
-                        self.add_stage("helo");
-                    }
-                }
-
-                if line.starts_with("MAIL FROM:") {
-                    self.smtp.mail_from_seen = true;
-                    self.add_stage("mail_from");
-                }
-
-                if line.starts_with("RCPT TO:") {
-                    self.smtp.rcpt_to_seen = true;
-                    if !self.smtp.stages.contains(&"rcpt_to".to_string()) {
-                        self.add_stage("rcpt_to");
-                    }
-                }
-
-                if line == "DATA" {
-                    self.smtp.data_started = true;
-                    self.add_stage("data");
-                }
-
-                if line == "." || line.ends_with("\r\n.\r\n") {
-                    if self.smtp.data_started && !self.smtp.data_finished {
-                        self.smtp.data_finished = true;
-                        self.add_stage("data_end");
-                    }
-                }
-
-                if line == "QUIT" {
-                    self.smtp.quit_seen = true;
-                    self.add_stage("quit");
-                }
-
-                if line == "STARTTLS" {
-                    self.smtp.starttls_seen = true;
-                    self.add_stage("starttls");
-                }
+            while let Some(line) = take_next_smtp_line(buffer) {
+                ready_lines.push(line);
             }
+        }
+
+        for line in ready_lines {
+            self.process_smtp_line(packet.direction, &line);
         }
     }
 
-    /// 添加 SMTP 阶段
+    fn process_smtp_line(&mut self, direction: Direction, raw_line: &[u8]) {
+        let line = trim_smtp_line(raw_line);
+        if line.is_empty() {
+            return;
+        }
+
+        match direction {
+            Direction::AtoB => self.process_client_smtp_line(line),
+            Direction::BtoA => self.process_server_smtp_line(line),
+        }
+    }
+
+    fn process_client_smtp_line(&mut self, line: &[u8]) {
+        // After the server replies 354, client -> server traffic is message body
+        // until the terminator line "." arrives.
+        if self.smtp.data_started && !self.smtp.data_finished {
+            if line == b"." {
+                self.smtp.data_finished = true;
+                self.add_stage("data_end");
+            }
+            return;
+        }
+
+        let line = String::from_utf8_lossy(line);
+        let line = line.as_ref();
+
+        if starts_with_ascii_case_insensitive(line, "EHLO ")
+            || starts_with_ascii_case_insensitive(line, "HELO ")
+        {
+            self.smtp.helo_seen = true;
+            self.add_stage("helo");
+        }
+
+        if starts_with_ascii_case_insensitive(line, "MAIL FROM:") {
+            self.smtp.mail_from_seen = true;
+            self.add_stage("mail_from");
+        }
+
+        if starts_with_ascii_case_insensitive(line, "RCPT TO:") {
+            self.smtp.rcpt_to_seen = true;
+            self.add_stage("rcpt_to");
+        }
+
+        if eq_ascii_case_insensitive(line, "DATA") {
+            self.smtp.awaiting_data_response = true;
+            self.add_stage("data");
+        }
+
+        if eq_ascii_case_insensitive(line, "QUIT") {
+            self.smtp.quit_seen = true;
+            self.add_stage("quit");
+        }
+
+        if eq_ascii_case_insensitive(line, "STARTTLS") {
+            self.smtp.starttls_seen = true;
+            self.add_stage("starttls");
+        }
+    }
+
+    fn process_server_smtp_line(&mut self, line: &[u8]) {
+        let line = String::from_utf8_lossy(line);
+        let line = line.as_ref();
+
+        if line.starts_with("220") && !self.smtp.banner_seen {
+            self.smtp.banner_seen = true;
+            self.add_stage("banner");
+        }
+
+        if self.smtp.awaiting_data_response && line.starts_with("354") {
+            self.smtp.awaiting_data_response = false;
+            self.smtp.data_started = true;
+        }
+    }
+
     fn add_stage(&mut self, stage: &str) {
-        if !self.smtp.stages.contains(&stage.to_string()) {
+        if !self.smtp.stages.iter().any(|existing| existing == stage) {
             self.smtp.stages.push(stage.to_string());
         }
     }
 
-    /// 获取主 VLAN ID (如果有)
     pub fn primary_vlan(&self) -> Option<u16> {
-        self.vlan_stack.first().copied()
+        if self.observed_vlan_stacks.len() == 1 {
+            self.observed_vlan_stacks[0].first().copied()
+        } else {
+            None
+        }
+    }
+
+    pub fn observed_vlans(&self) -> Vec<String> {
+        self.observed_vlan_stacks
+            .iter()
+            .map(|stack| {
+                if stack.is_empty() {
+                    "untagged".to_string()
+                } else {
+                    stack.iter().map(u16::to_string).collect::<Vec<_>>().join("/")
+                }
+            })
+            .collect()
+    }
+}
+
+fn starts_with_ascii_case_insensitive(input: &str, prefix: &str) -> bool {
+    input
+        .get(..prefix.len())
+        .map(|candidate| candidate.eq_ignore_ascii_case(prefix))
+        .unwrap_or(false)
+}
+
+fn eq_ascii_case_insensitive(input: &str, expected: &str) -> bool {
+    input.eq_ignore_ascii_case(expected)
+}
+
+fn take_next_smtp_line(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
+    let newline_index = buffer.iter().position(|byte| *byte == b'\n')?;
+    Some(buffer.drain(..=newline_index).collect())
+}
+
+fn trim_smtp_line(line: &[u8]) -> &[u8] {
+    let mut end = line.len();
+    while end > 0 && matches!(line[end - 1], b'\r' | b'\n') {
+        end -= 1;
+    }
+    &line[..end]
+}
+
+fn update_u32_min_max(min_slot: &mut Option<u32>, max_slot: &mut Option<u32>, value: u32) {
+    match min_slot {
+        Some(current) if value >= *current => {}
+        _ => *min_slot = Some(value),
+    }
+
+    match max_slot {
+        Some(current) if value <= *current => {}
+        _ => *max_slot = Some(value),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FlowData;
+    use crate::model::{DecodedPacket, Direction, TcpFlags};
+    use smallvec::SmallVec;
+
+    fn create_packet(direction: Direction, payload: &[u8]) -> DecodedPacket {
+        DecodedPacket {
+            vlan_stack: SmallVec::new(),
+            src_ip: "10.0.0.10".to_string(),
+            src_port: 43210,
+            dst_ip: "10.0.0.20".to_string(),
+            dst_port: 25,
+            protocol: 6,
+            direction,
+            seq_num: if direction == Direction::AtoB { 1000 } else { 5000 },
+            ack_num: if direction == Direction::AtoB { 5001 } else { 1001 },
+            tcp_flags: TcpFlags {
+                fin: false,
+                syn: false,
+                rst: false,
+                psh: !payload.is_empty(),
+                ack: true,
+            },
+            payload: payload.to_vec(),
+            timestamp_micros: 0,
+        }
+    }
+
+    #[test]
+    fn smtp_data_end_is_detected_when_terminator_spans_packets() {
+        let mut flow = FlowData::new(
+            "10.0.0.10".to_string(),
+            43210,
+            "10.0.0.20".to_string(),
+            25,
+            SmallVec::new(),
+        );
+
+        let packets = vec![
+            create_packet(Direction::BtoA, b"220 mail.test\r\n"),
+            create_packet(Direction::AtoB, b"EHLO client\r\n"),
+            create_packet(Direction::AtoB, b"MAIL FROM:<sender@test>\r\n"),
+            create_packet(Direction::AtoB, b"RCPT TO:<rcpt@test>\r\n"),
+            create_packet(Direction::AtoB, b"DATA\r\n"),
+            create_packet(Direction::BtoA, b"354 Ok Send data ending with <CRLF>.<CRLF>\r\n"),
+            create_packet(
+                Direction::AtoB,
+                b"------=_NextPart_000_013D_01A0C443.14EBABF0--\r\n.",
+            ),
+            create_packet(Direction::AtoB, b"\r\n"),
+        ];
+
+        for packet in &packets {
+            flow.add_packet(packet);
+        }
+
+        assert!(flow.smtp.data_started);
+        assert!(flow.smtp.data_finished);
+        assert!(flow.smtp.stages.iter().any(|stage| stage == "data_end"));
+    }
+
+    #[test]
+    fn smtp_command_is_detected_when_split_across_packets() {
+        let mut flow = FlowData::new(
+            "10.0.0.10".to_string(),
+            43210,
+            "10.0.0.20".to_string(),
+            25,
+            SmallVec::new(),
+        );
+
+        flow.add_packet(&create_packet(Direction::AtoB, b"EH"));
+        flow.add_packet(&create_packet(Direction::AtoB, b"LO client\r\n"));
+
+        assert!(flow.smtp.helo_seen);
+        assert!(flow.smtp.stages.iter().any(|stage| stage == "helo"));
+    }
+
+    #[test]
+    fn smtp_data_end_is_detected_for_pipelined_mail_rcpt_data_sequence() {
+        let mut flow = FlowData::new(
+            "10.0.0.10".to_string(),
+            43210,
+            "10.0.0.20".to_string(),
+            25,
+            SmallVec::new(),
+        );
+
+        let packets = vec![
+            create_packet(Direction::BtoA, b"220 server ready\r\n"),
+            create_packet(Direction::AtoB, b"EHLO mailgw4.pipechina.com.cn\r\n"),
+            create_packet(Direction::BtoA, b"250-PIPELINING\r\n250 8BITMIME\r\n"),
+            create_packet(
+                Direction::AtoB,
+                b"MAIL FROM:<system.reminder@caschina.cn>\r\nRCPT TO:<wangfj@pipechina.com.cn>\r\nDATA\r\n",
+            ),
+            create_packet(
+                Direction::BtoA,
+                b"250 2.1.0 Sender OK\r\n250 2.1.5 Recipient OK\r\n354 Ok Send data ending with <CRLF>.<CRLF>\r\n",
+            ),
+            create_packet(Direction::AtoB, b"Received: from upstream.example\r\n"),
+            create_packet(Direction::AtoB, b"Content-Transfer-Encoding: base64\r\n"),
+            create_packet(Direction::AtoB, b"U29tZSBiYXNlNjQgYm9keQ==\r\n.\r"),
+            create_packet(Direction::AtoB, b"\n"),
+            create_packet(Direction::BtoA, b"250 2.6.0 Message received\r\n"),
+            create_packet(Direction::AtoB, b"QUIT\r\n"),
+        ];
+
+        for packet in &packets {
+            flow.add_packet(packet);
+        }
+
+        assert!(flow.smtp.mail_from_seen);
+        assert!(flow.smtp.rcpt_to_seen);
+        assert!(flow.smtp.data_started);
+        assert!(flow.smtp.data_finished);
+        assert!(flow.smtp.quit_seen);
+        assert!(!flow.smtp.awaiting_data_response);
     }
 }
