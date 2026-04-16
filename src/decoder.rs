@@ -33,7 +33,7 @@ impl Decoder {
         data: &[u8],
         timestamp: i64,
         link_type: Linktype,
-    ) -> Result<Vec<DecodedPacket>> {
+    ) -> Result<Option<DecodedPacket>> {
         let sliced = match link_type {
             Linktype::ETHERNET => SlicedPacket::from_ethernet(data),
             Linktype::LINUX_SLL => SlicedPacket::from_linux_sll(data),
@@ -49,10 +49,10 @@ impl Decoder {
         &self,
         sliced: SlicedPacket<'_>,
         timestamp: i64,
-    ) -> Result<Vec<DecodedPacket>> {
+    ) -> Result<Option<DecodedPacket>> {
         let transport = match sliced.transport {
             Some(TransportSlice::Tcp(tcp)) => tcp,
-            _ => return Ok(Vec::new()),
+            _ => return Ok(None),
         };
 
         let (src_ip, dst_ip) = match sliced.net {
@@ -64,7 +64,7 @@ impl Decoder {
                 ipv6.header().source_addr().to_string(),
                 ipv6.header().destination_addr().to_string(),
             ),
-            None => return Ok(Vec::new()),
+            None => return Ok(None),
         };
 
         let src_port = transport.source_port();
@@ -73,10 +73,11 @@ impl Decoder {
         let dst_is_service = self.ports.contains(&dst_port);
 
         if !src_is_service && !dst_is_service {
-            return Ok(Vec::new());
+            return Ok(None);
         }
 
-        let direction = Self::determine_direction(src_port, dst_port, src_is_service, dst_is_service);
+        let direction =
+            Self::determine_direction(src_port, dst_port, src_is_service, dst_is_service);
 
         let (client_ip, client_port, server_ip, server_port) = if direction == Direction::AtoB {
             (src_ip, src_port, dst_ip, dst_port)
@@ -107,7 +108,7 @@ impl Decoder {
             timestamp_micros: timestamp,
         };
 
-        Ok(vec![packet])
+        Ok(Some(packet))
     }
 
     fn determine_direction(
@@ -152,5 +153,103 @@ impl Decoder {
 impl Default for Decoder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use etherparse::PacketBuilder;
+
+    use super::Decoder;
+    use crate::model::Direction;
+    use pcap_parser::Linktype;
+
+    fn build_tcp_packet(
+        src_ip: [u8; 4],
+        dst_ip: [u8; 4],
+        src_port: u16,
+        dst_port: u16,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let builder = PacketBuilder::ethernet2(
+            [0x10, 0x20, 0x30, 0x40, 0x50, 0x60],
+            [0x70, 0x80, 0x90, 0xa0, 0xb0, 0xc0],
+        )
+        .ipv4(src_ip, dst_ip, 64)
+        .tcp(src_port, dst_port, 1000, 4096)
+        .ack(5000)
+        .psh();
+
+        let mut bytes = Vec::with_capacity(builder.size(payload.len()));
+        builder
+            .write(&mut bytes, payload)
+            .expect("test packet should serialize");
+        bytes
+    }
+
+    #[test]
+    fn decode_with_linktype_returns_client_to_server_packet() {
+        let decoder = Decoder::default();
+        let packet = build_tcp_packet(
+            [192, 0, 2, 10],
+            [198, 51, 100, 25],
+            43210,
+            25,
+            b"EHLO example.test\r\n",
+        );
+
+        let decoded = decoder
+            .decode_with_linktype(&packet, 123, Linktype::ETHERNET)
+            .expect("decode should succeed")
+            .expect("SMTP packet should be kept");
+
+        assert_eq!(decoded.direction, Direction::AtoB);
+        assert_eq!(decoded.src_ip, "192.0.2.10");
+        assert_eq!(decoded.src_port, 43210);
+        assert_eq!(decoded.dst_ip, "198.51.100.25");
+        assert_eq!(decoded.dst_port, 25);
+        assert_eq!(decoded.payload, b"EHLO example.test\r\n");
+    }
+
+    #[test]
+    fn decode_with_linktype_normalizes_server_to_client_packet() {
+        let decoder = Decoder::default();
+        let packet = build_tcp_packet(
+            [198, 51, 100, 25],
+            [192, 0, 2, 10],
+            25,
+            43210,
+            b"220 mail.example.test\r\n",
+        );
+
+        let decoded = decoder
+            .decode_with_linktype(&packet, 456, Linktype::ETHERNET)
+            .expect("decode should succeed")
+            .expect("SMTP packet should be kept");
+
+        assert_eq!(decoded.direction, Direction::BtoA);
+        assert_eq!(decoded.src_ip, "192.0.2.10");
+        assert_eq!(decoded.src_port, 43210);
+        assert_eq!(decoded.dst_ip, "198.51.100.25");
+        assert_eq!(decoded.dst_port, 25);
+        assert_eq!(decoded.payload, b"220 mail.example.test\r\n");
+    }
+
+    #[test]
+    fn decode_with_linktype_filters_untracked_ports() {
+        let decoder = Decoder::default();
+        let packet = build_tcp_packet(
+            [192, 0, 2, 10],
+            [198, 51, 100, 25],
+            43210,
+            2525,
+            b"not smtp",
+        );
+
+        let decoded = decoder
+            .decode_with_linktype(&packet, 789, Linktype::ETHERNET)
+            .expect("decode should succeed");
+
+        assert!(decoded.is_none());
     }
 }

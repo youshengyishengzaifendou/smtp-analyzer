@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 
+use crate::diagnostic_text;
 use crate::flow::{FlowData, FlowTable};
 use crate::model::{
     Completeness, Diagnostic, Directionality, FlowResult, Report, SmtpState, Summary, TcpState,
@@ -172,8 +173,9 @@ impl Analyzer {
                 .get(&identity)
                 .cloned()
                 .unwrap_or_default();
+            let summary_label = diagnostic_text::label(&diagnostic.kind);
             diagnostic.summary =
-                Self::format_diagnostic_summary(&diagnostic.kind, &diagnostic.flow_indices);
+                diagnostic_text::format_summary(&summary_label, &diagnostic.flow_indices, None);
         }
 
         diagnostics.sort_by(|a, b| {
@@ -189,7 +191,7 @@ impl Analyzer {
             .map(|diagnostic| {
                 (
                     FlowIdentity::from_diagnostic(diagnostic),
-                    Self::diagnostic_kind_label(&diagnostic.kind).to_string(),
+                    diagnostic_text::label(&diagnostic.kind).into_owned(),
                 )
             })
             .collect();
@@ -199,59 +201,8 @@ impl Analyzer {
             flow.diagnostic_notes = label_by_identity
                 .get(&identity)
                 .cloned()
-                .map(|label| vec![format!("第{}个流：{}", flow.flow_index, label)])
+                .map(|label| vec![diagnostic_text::format_note(&label, flow.flow_index)])
                 .unwrap_or_default();
-        }
-    }
-
-    fn format_diagnostic_summary(kind: &str, flow_indices: &[usize]) -> String {
-        let label = Self::diagnostic_kind_label(kind);
-        if flow_indices.is_empty() {
-            label.to_string()
-        } else {
-            format!("第{}个流：{}", Self::format_flow_ranges(flow_indices), label)
-        }
-    }
-
-    fn diagnostic_kind_label(kind: &str) -> &'static str {
-        match kind {
-            "vlan_asymmetry" => "疑似 VLAN 不对称",
-            _ => "存在异常",
-        }
-    }
-
-    fn format_flow_ranges(flow_indices: &[usize]) -> String {
-        if flow_indices.is_empty() {
-            return String::new();
-        }
-
-        let mut normalized = flow_indices.to_vec();
-        normalized.sort_unstable();
-        normalized.dedup();
-
-        let mut ranges = Vec::new();
-        let mut start = normalized[0];
-        let mut end = normalized[0];
-
-        for &value in normalized.iter().skip(1) {
-            if value == end + 1 {
-                end = value;
-            } else {
-                ranges.push(Self::format_single_range(start, end));
-                start = value;
-                end = value;
-            }
-        }
-
-        ranges.push(Self::format_single_range(start, end));
-        ranges.join("、")
-    }
-
-    fn format_single_range(start: usize, end: usize) -> String {
-        if start == end {
-            start.to_string()
-        } else {
-            format!("{start}-{end}")
         }
     }
 
@@ -472,7 +423,9 @@ impl Analyzer {
         }
 
         if merged_recovers_handshake && merged_recovers_bidirectional {
-            evidence.push("忽略 VLAN 后，合并视图恢复为握手完整且双向都有有效载荷的单条流。".to_string());
+            evidence.push(
+                "忽略 VLAN 后，合并视图恢复为握手完整且双向都有有效载荷的单条流。".to_string(),
+            );
         } else if merged_recovers_handshake {
             evidence.push("忽略 VLAN 后，合并视图恢复了完整 TCP 三次握手。".to_string());
         } else if merged_recovers_bidirectional {
@@ -484,7 +437,9 @@ impl Analyzer {
         }
 
         if merged_flow.smtp.starttls_seen {
-            evidence.push("合并视图中还能看到 STARTTLS 阶段，说明应用层阶段信息也受拆流影响。".to_string());
+            evidence.push(
+                "合并视图中还能看到 STARTTLS 阶段，说明应用层阶段信息也受拆流影响。".to_string(),
+            );
         }
 
         evidence
@@ -555,8 +510,16 @@ mod tests {
             dst_port: 25,
             protocol: 6,
             direction,
-            seq_num: if direction == Direction::AtoB { 1000 } else { 5000 },
-            ack_num: if direction == Direction::AtoB { 5001 } else { 1001 },
+            seq_num: if direction == Direction::AtoB {
+                1000
+            } else {
+                5000
+            },
+            ack_num: if direction == Direction::AtoB {
+                5001
+            } else {
+                1001
+            },
             tcp_flags: TcpFlags {
                 fin: false,
                 syn,
@@ -639,10 +602,10 @@ mod tests {
         assert_eq!(report.diagnostics.len(), 1);
         assert_eq!(report.diagnostics[0].flow_indices, vec![1, 2]);
         assert_eq!(report.diagnostics[0].summary, "第1-2个流：疑似 VLAN 不对称");
-        assert!(report
-            .flows
+        assert!(report.flows.iter().all(|flow| flow
+            .anomaly_tags
             .iter()
-            .all(|flow| flow.anomaly_tags.iter().any(|tag| tag == "vlan_asymmetry_likely")));
+            .any(|tag| tag == "vlan_asymmetry_likely")));
         assert_eq!(report.flows[0].flow_index, 1);
         assert_eq!(report.flows[1].flow_index, 2);
         assert_eq!(
@@ -667,7 +630,13 @@ mod tests {
             create_packet(&[], Direction::BtoA, false, true, b"220 banner\r\n"),
             create_packet(&[100], Direction::AtoB, true, false, b""),
             create_packet(&[100], Direction::BtoA, true, true, b""),
-            create_packet(&[100], Direction::AtoB, false, true, b"MAIL FROM:<b@test>\r\n"),
+            create_packet(
+                &[100],
+                Direction::AtoB,
+                false,
+                true,
+                b"MAIL FROM:<b@test>\r\n",
+            ),
             create_packet(&[100], Direction::BtoA, false, true, b"220 banner\r\n"),
         ];
 

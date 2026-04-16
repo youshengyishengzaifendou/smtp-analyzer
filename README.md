@@ -67,6 +67,28 @@ smtp-analyzer serve --host 127.0.0.1 --port 8080
 - 切换 Ignore VLAN 主视图
 - 查看汇总指标、疑似 VLAN 不对称诊断和每条流的详情
 
+### Smoke Test
+
+可以用仓库内置脚本做一次本地端到端冒烟验证：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\smoke-test.ps1
+```
+
+该脚本会自动启动本地服务，检查 `/health`，再上传 `service_test_sample.pcap` 做一次分析，最后自动关闭服务进程。
+
+### Development Checks
+
+提交前建议至少运行以下检查：
+
+```powershell
+cargo fmt --all
+cargo test
+powershell -ExecutionPolicy Bypass -File .\scripts\smoke-test.ps1
+```
+
+仓库中的 GitHub Actions 也会执行同样的格式化、单元测试和冒烟验证。
+
 ### 其他选项
 
 ```

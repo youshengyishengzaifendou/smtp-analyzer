@@ -1,13 +1,13 @@
 //! 数据模型定义
 
-use smallvec::SmallVec;
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 
 /// 流向枚举
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Direction {
-    AtoB,  // 第一个看到的源 → 目标
-    BtoA,  // 第一个看到的目标 → 源
+    AtoB, // 第一个看到的源 → 目标
+    BtoA, // 第一个看到的目标 → 源
 }
 
 impl Default for Direction {
@@ -21,15 +21,15 @@ impl Default for Direction {
 #[serde(rename_all = "lowercase")]
 pub enum Completeness {
     Complete,   // 完整
-    Incomplete,  // 残缺
+    Incomplete, // 残缺
 }
 
 /// 双向性结论
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Directionality {
-    Bidirectional,   // 双向
-    Unidirectional,  // 单向
+    Bidirectional,  // 双向
+    Unidirectional, // 单向
 }
 
 /// 端点信息
@@ -70,7 +70,12 @@ impl SessionKey {
     ) -> Self {
         let a = Endpoint::new(src_ip, src_port);
         let b = Endpoint::new(dst_ip, dst_port);
-        Self { vlan_stack, protocol, a, b }
+        Self {
+            vlan_stack,
+            protocol,
+            a,
+            b,
+        }
     }
 }
 
@@ -145,6 +150,10 @@ pub struct SmtpState {
     pub is_implicit_tls: bool,
     /// 是否见过 STARTTLS
     pub starttls_seen: bool,
+    /// 是否正在等待服务端对 STARTTLS 的响应
+    pub awaiting_starttls_response: bool,
+    /// STARTTLS 已完成升级，后续流量不再按 SMTP 文本解析
+    pub tls_active: bool,
     /// 经过的 SMTP 阶段列表
     pub stages: Vec<String>,
     /// Whether the client has sent DATA and we are still waiting for 354.

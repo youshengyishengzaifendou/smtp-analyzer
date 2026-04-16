@@ -138,11 +138,10 @@ mod tests {
         assert_eq!(response.report.summary.total_flows, 2);
         assert_eq!(response.report.summary.suspected_vlan_asymmetry_sessions, 1);
         assert_eq!(response.report.diagnostics.len(), 1);
-        assert!(response
-            .report
-            .flows
+        assert!(response.report.flows.iter().all(|flow| flow
+            .anomaly_tags
             .iter()
-            .all(|flow| flow.anomaly_tags.iter().any(|tag| tag == "vlan_asymmetry_likely")));
+            .any(|tag| tag == "vlan_asymmetry_likely")));
     }
 
     #[test]
@@ -166,7 +165,10 @@ mod tests {
             .expect("merged sample should produce one flow");
         assert_eq!(flow.completeness, Completeness::Complete);
         assert_eq!(flow.directionality, Directionality::Bidirectional);
-        assert_eq!(flow.observed_vlans, vec!["untagged".to_string(), "100".to_string()]);
+        assert_eq!(
+            flow.observed_vlans,
+            vec!["untagged".to_string(), "100".to_string()]
+        );
         assert_eq!(flow.anomaly_tags, vec!["vlan_asymmetry_likely".to_string()]);
     }
 }

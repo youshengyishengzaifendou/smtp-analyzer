@@ -6,6 +6,7 @@ mod analyzer;
 mod app;
 mod capture;
 mod decoder;
+mod diagnostic_text;
 mod error;
 mod flow;
 mod model;
@@ -127,7 +128,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             Ok(())
         }
-        Command::Serve { host, port, verbose } => {
+        Command::Serve {
+            host,
+            port,
+            verbose,
+        } => {
             init_logging(verbose);
             service::serve(&host, port)?;
             Ok(())

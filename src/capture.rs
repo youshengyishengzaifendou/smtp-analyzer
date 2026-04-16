@@ -45,7 +45,8 @@ pub struct CaptureReader {
 impl CaptureReader {
     /// 打开 pcap/pcapng 文件
     pub fn open(path: &str, ports: Vec<u16>) -> Result<Self> {
-        let file = File::open(path).map_err(|e| AnalyzerError::FileOpen(format!("{}: {}", path, e)))?;
+        let file =
+            File::open(path).map_err(|e| AnalyzerError::FileOpen(format!("{}: {}", path, e)))?;
         let reader = create_reader(DEFAULT_BUFFER_SIZE, file)
             .map_err(|e| AnalyzerError::PcapParse(format!("无法创建抓包读取器: {:?}", e)))?;
 
@@ -90,9 +91,18 @@ impl CaptureReader {
                     return None;
                 }
 
-                let timestamp =
-                    Self::legacy_timestamp_micros(*legacy_ns_precision, packet.ts_sec, packet.ts_usec);
-                Self::decode_packet(decoder, skipped_count, packet.data, timestamp, *legacy_linktype)
+                let timestamp = Self::legacy_timestamp_micros(
+                    *legacy_ns_precision,
+                    packet.ts_sec,
+                    packet.ts_usec,
+                );
+                Self::decode_packet(
+                    decoder,
+                    skipped_count,
+                    packet.data,
+                    timestamp,
+                    *legacy_linktype,
+                )
             }
             PcapBlockOwned::NG(Block::SectionHeader(_)) => {
                 interfaces.clear();
@@ -108,17 +118,24 @@ impl CaptureReader {
                     return None;
                 }
 
-                let interface = interfaces
-                    .get(epb.if_id as usize)
-                    .copied()
-                    .unwrap_or(InterfaceState {
-                        linktype: Linktype::ETHERNET,
-                        ts_resolution: 1_000_000,
-                        ts_offset: 0,
-                });
+                let interface =
+                    interfaces
+                        .get(epb.if_id as usize)
+                        .copied()
+                        .unwrap_or(InterfaceState {
+                            linktype: Linktype::ETHERNET,
+                            ts_resolution: 1_000_000,
+                            ts_offset: 0,
+                        });
                 let timestamp = Self::pcapng_timestamp_micros(epb.ts_high, epb.ts_low, interface);
 
-                Self::decode_packet(decoder, skipped_count, packet_data, timestamp, interface.linktype)
+                Self::decode_packet(
+                    decoder,
+                    skipped_count,
+                    packet_data,
+                    timestamp,
+                    interface.linktype,
+                )
             }
             PcapBlockOwned::NG(Block::SimplePacket(spb)) => {
                 let packet_data = spb.packet_data();
@@ -154,7 +171,7 @@ impl CaptureReader {
         linktype: Linktype,
     ) -> Option<Result<DecodedPacket>> {
         match decoder.decode_with_linktype(packet_data, timestamp, linktype) {
-            Ok(mut packets) => packets.drain(..).next().map(Ok),
+            Ok(packet) => packet.map(Ok),
             Err(e) => {
                 *skipped_count += 1;
                 debug!("跳过无法解析的数据包: {}", e);

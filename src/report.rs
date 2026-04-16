@@ -3,6 +3,7 @@
 use std::fs::File;
 use std::io::BufWriter;
 
+use crate::diagnostic_text;
 use crate::error::{AnalyzerError, Result};
 use crate::model::{Completeness, Diagnostic, Directionality, FlowResult, Report};
 
@@ -38,8 +39,7 @@ impl ReportWriter {
         println!("{:<20} {:>10}", "跳过的包", summary.skipped_packets);
         println!(
             "{:<20} {:>10}",
-            "疑似 VLAN 不对称",
-            summary.suspected_vlan_asymmetry_sessions
+            "疑似 VLAN 不对称", summary.suspected_vlan_asymmetry_sessions
         );
         println!();
         println!("{}", "-".repeat(total_width));
@@ -106,7 +106,7 @@ impl ReportWriter {
     }
 
     fn print_diagnostics(diagnostics: &[Diagnostic]) {
-        let grouped = Self::group_diagnostics(diagnostics);
+        let grouped = diagnostic_text::group_summaries(diagnostics);
         println!("诊断结论");
         println!("{}", "-".repeat(95));
 
@@ -118,8 +118,8 @@ impl ReportWriter {
     }
 
     pub fn write_json(report: &Report, path: &str) -> Result<()> {
-        let file = File::create(path)
-            .map_err(|e| AnalyzerError::FileOpen(format!("{}: {}", path, e)))?;
+        let file =
+            File::create(path).map_err(|e| AnalyzerError::FileOpen(format!("{}: {}", path, e)))?;
 
         let writer = BufWriter::new(file);
         serde_json::to_writer_pretty(writer, report)?;
@@ -128,8 +128,8 @@ impl ReportWriter {
     }
 
     pub fn write_csv(report: &Report, path: &str) -> Result<()> {
-        let file = File::create(path)
-            .map_err(|e| AnalyzerError::FileOpen(format!("{}: {}", path, e)))?;
+        let file =
+            File::create(path).map_err(|e| AnalyzerError::FileOpen(format!("{}: {}", path, e)))?;
 
         let mut writer = csv::Writer::from_writer(file);
 
@@ -240,89 +240,6 @@ impl ReportWriter {
                 Some(v) => v.to_string(),
                 None => "-".to_string(),
             }
-        }
-    }
-
-    fn group_diagnostics(diagnostics: &[Diagnostic]) -> Vec<String> {
-        let mut grouped: Vec<(String, Vec<usize>, String)> = Vec::new();
-
-        for diagnostic in diagnostics {
-            let label = Self::diagnostic_label(diagnostic);
-            if let Some(existing) = grouped.iter_mut().find(|item| item.0 == label) {
-                existing.1.extend_from_slice(&diagnostic.flow_indices);
-                if existing.2.is_empty() {
-                    existing.2 = diagnostic.summary.clone();
-                }
-            } else {
-                grouped.push((
-                    label,
-                    diagnostic.flow_indices.clone(),
-                    diagnostic.summary.clone(),
-                ));
-            }
-        }
-
-        let mut result = grouped
-            .into_iter()
-            .map(|(label, flow_indices, fallback_summary)| {
-                let first_index = flow_indices.iter().copied().min().unwrap_or(usize::MAX);
-                let summary = if flow_indices.is_empty() {
-                    if fallback_summary.is_empty() {
-                        label
-                    } else {
-                        fallback_summary
-                    }
-                } else {
-                    format!("第{}个流：{}", Self::format_flow_ranges(&flow_indices), label)
-                };
-                (first_index, summary)
-            })
-            .collect::<Vec<_>>();
-
-        result.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-        result.into_iter().map(|(_, summary)| summary).collect()
-    }
-
-    fn diagnostic_label(diagnostic: &Diagnostic) -> String {
-        match diagnostic.kind.as_str() {
-            "vlan_asymmetry" => "疑似 VLAN 不对称".to_string(),
-            _ if !diagnostic.kind.is_empty() => diagnostic.kind.clone(),
-            _ => "存在异常".to_string(),
-        }
-    }
-
-    fn format_flow_ranges(flow_indices: &[usize]) -> String {
-        let mut normalized = flow_indices.to_vec();
-        normalized.sort_unstable();
-        normalized.dedup();
-
-        if normalized.is_empty() {
-            return String::new();
-        }
-
-        let mut ranges = Vec::new();
-        let mut start = normalized[0];
-        let mut end = normalized[0];
-
-        for &value in normalized.iter().skip(1) {
-            if value == end + 1 {
-                end = value;
-            } else {
-                ranges.push(Self::format_single_range(start, end));
-                start = value;
-                end = value;
-            }
-        }
-
-        ranges.push(Self::format_single_range(start, end));
-        ranges.join("、")
-    }
-
-    fn format_single_range(start: usize, end: usize) -> String {
-        if start == end {
-            start.to_string()
-        } else {
-            format!("{start}-{end}")
         }
     }
 }

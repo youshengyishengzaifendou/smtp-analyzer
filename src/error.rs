@@ -4,6 +4,9 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum AnalyzerError {
+    #[error("无效输入: {0}")]
+    InvalidInput(String),
+
     #[error("无法打开文件: {0}")]
     FileOpen(String),
 

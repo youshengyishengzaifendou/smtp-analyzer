@@ -8,6 +8,8 @@ use smallvec::SmallVec;
 
 use crate::model::{DecodedPacket, Direction, SessionKey, SmtpState, TcpState};
 
+const MAX_PENDING_SMTP_LINE_BYTES: usize = 16 * 1024;
+
 /// Aggregated flow table keyed by normalized session identity.
 pub struct FlowTable {
     /// Whether VLAN tags should be ignored when building the session key.
@@ -171,6 +173,7 @@ impl FlowData {
             self.update_smtp_state(packet);
         } else if self.dst_port == 465 {
             self.smtp.is_implicit_tls = true;
+            self.smtp.tls_active = true;
         }
     }
 
@@ -186,7 +189,7 @@ impl FlowData {
 
     fn update_smtp_state(&mut self, packet: &DecodedPacket) {
         let payload = &packet.payload;
-        if payload.is_empty() {
+        if payload.is_empty() || self.smtp.tls_active {
             return;
         }
 
@@ -202,9 +205,16 @@ impl FlowData {
             while let Some(line) = take_next_smtp_line(buffer) {
                 ready_lines.push(line);
             }
+
+            if buffer.len() > MAX_PENDING_SMTP_LINE_BYTES {
+                buffer.clear();
+            }
         }
 
         for line in ready_lines {
+            if self.smtp.tls_active {
+                break;
+            }
             self.process_smtp_line(packet.direction, &line);
         }
     }
@@ -264,6 +274,7 @@ impl FlowData {
 
         if eq_ascii_case_insensitive(line, "STARTTLS") {
             self.smtp.starttls_seen = true;
+            self.smtp.awaiting_starttls_response = true;
             self.add_stage("starttls");
         }
     }
@@ -271,6 +282,14 @@ impl FlowData {
     fn process_server_smtp_line(&mut self, line: &[u8]) {
         let line = String::from_utf8_lossy(line);
         let line = line.as_ref();
+
+        if self.smtp.awaiting_starttls_response {
+            self.smtp.awaiting_starttls_response = false;
+            if line.starts_with("220") {
+                self.promote_to_tls();
+            }
+            return;
+        }
 
         if line.starts_with("220") && !self.smtp.banner_seen {
             self.smtp.banner_seen = true;
@@ -281,6 +300,16 @@ impl FlowData {
             self.smtp.awaiting_data_response = false;
             self.smtp.data_started = true;
         }
+    }
+
+    fn promote_to_tls(&mut self) {
+        self.smtp.tls_active = true;
+        self.clear_pending_smtp_buffers();
+    }
+
+    fn clear_pending_smtp_buffers(&mut self) {
+        self.smtp.pending_line_ab.clear();
+        self.smtp.pending_line_ba.clear();
     }
 
     fn add_stage(&mut self, stage: &str) {
@@ -304,7 +333,11 @@ impl FlowData {
                 if stack.is_empty() {
                     "untagged".to_string()
                 } else {
-                    stack.iter().map(u16::to_string).collect::<Vec<_>>().join("/")
+                    stack
+                        .iter()
+                        .map(u16::to_string)
+                        .collect::<Vec<_>>()
+                        .join("/")
                 }
             })
             .collect()
@@ -362,8 +395,16 @@ mod tests {
             dst_port: 25,
             protocol: 6,
             direction,
-            seq_num: if direction == Direction::AtoB { 1000 } else { 5000 },
-            ack_num: if direction == Direction::AtoB { 5001 } else { 1001 },
+            seq_num: if direction == Direction::AtoB {
+                1000
+            } else {
+                5000
+            },
+            ack_num: if direction == Direction::AtoB {
+                5001
+            } else {
+                1001
+            },
             tcp_flags: TcpFlags {
                 fin: false,
                 syn: false,
@@ -392,7 +433,10 @@ mod tests {
             create_packet(Direction::AtoB, b"MAIL FROM:<sender@test>\r\n"),
             create_packet(Direction::AtoB, b"RCPT TO:<rcpt@test>\r\n"),
             create_packet(Direction::AtoB, b"DATA\r\n"),
-            create_packet(Direction::BtoA, b"354 Ok Send data ending with <CRLF>.<CRLF>\r\n"),
+            create_packet(
+                Direction::BtoA,
+                b"354 Ok Send data ending with <CRLF>.<CRLF>\r\n",
+            ),
             create_packet(
                 Direction::AtoB,
                 b"------=_NextPart_000_013D_01A0C443.14EBABF0--\r\n.",
@@ -466,5 +510,67 @@ mod tests {
         assert!(flow.smtp.data_finished);
         assert!(flow.smtp.quit_seen);
         assert!(!flow.smtp.awaiting_data_response);
+    }
+
+    #[test]
+    fn smtp_parsing_stops_after_starttls_is_accepted() {
+        let mut flow = FlowData::new(
+            "10.0.0.10".to_string(),
+            43210,
+            "10.0.0.20".to_string(),
+            587,
+            SmallVec::new(),
+        );
+
+        let packets = vec![
+            create_packet(Direction::BtoA, b"220 server ready\r\n"),
+            create_packet(Direction::AtoB, b"EHLO client\r\n"),
+            create_packet(Direction::AtoB, b"STARTTLS\r\n"),
+            create_packet(Direction::BtoA, b"220 Ready to start TLS\r\n"),
+            create_packet(Direction::AtoB, b"MAIL FROM:<after-tls@test>\r\n"),
+            create_packet(
+                Direction::BtoA,
+                b"\x16\x03\x03\x00.\x02\x00binary tls data without smtp",
+            ),
+        ];
+
+        for packet in &packets {
+            flow.add_packet(packet);
+        }
+
+        assert!(flow.smtp.starttls_seen);
+        assert!(flow.smtp.tls_active);
+        assert!(!flow.smtp.awaiting_starttls_response);
+        assert!(!flow.smtp.mail_from_seen);
+        assert!(flow.smtp.pending_line_ab.is_empty());
+        assert!(flow.smtp.pending_line_ba.is_empty());
+    }
+
+    #[test]
+    fn smtp_parsing_continues_when_starttls_is_rejected() {
+        let mut flow = FlowData::new(
+            "10.0.0.10".to_string(),
+            43210,
+            "10.0.0.20".to_string(),
+            587,
+            SmallVec::new(),
+        );
+
+        let packets = vec![
+            create_packet(Direction::BtoA, b"220 server ready\r\n"),
+            create_packet(Direction::AtoB, b"EHLO client\r\n"),
+            create_packet(Direction::AtoB, b"STARTTLS\r\n"),
+            create_packet(Direction::BtoA, b"454 TLS not available\r\n"),
+            create_packet(Direction::AtoB, b"MAIL FROM:<fallback@test>\r\n"),
+        ];
+
+        for packet in &packets {
+            flow.add_packet(packet);
+        }
+
+        assert!(flow.smtp.starttls_seen);
+        assert!(!flow.smtp.tls_active);
+        assert!(!flow.smtp.awaiting_starttls_response);
+        assert!(flow.smtp.mail_from_seen);
     }
 }
